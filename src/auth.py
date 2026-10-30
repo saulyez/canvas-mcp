@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -7,6 +8,8 @@ import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 class CanvasAuth:
     """Handles OAuth2 authentication and token management for Canvas."""
@@ -26,9 +29,12 @@ class CanvasAuth:
         self.tokens: Dict[str, Any] = self._load_tokens()
 
         if self.direct_token:
-            print("Direct Access Token detected. Bypassing OAuth2 flow.")
+            # stdout is the MCP stdio channel — never print() here.
+            log.info("Direct Access Token detected. Bypassing OAuth2 flow.")
             self.tokens["access_token"] = self.direct_token
-            self.tokens["expires_at"] = time.time() + (365 * 24 * 3600) # Set to 1 year from now
+            # Canvas doesn't tell us a manual token's expiry; a real expiry surfaces as
+            # CanvasAuthError from the client (401 "Expired access token.").
+            self.tokens["expires_at"] = time.time() + (365 * 24 * 3600)
             self._save_tokens()
 
 
