@@ -83,7 +83,9 @@ async def list_announcements(course_id: str) -> list[dict]:
 async def download_course_materials(course_id: str, destination_root: str = "downloads", dry_run: bool = False) -> dict:
     """
     Downloads every file (any type) linked from the course's modules into
-    <destination_root>/<course name>/<module name>/<file>.
+    <destination_root>/<course name>/<module folder>/<file>, where week modules
+    become week_N (week_A-B for ranges, s2_week_N for semester 2) and other
+    modules become lowercase snake_case; same-named folders are merged.
 
     Files are discovered from File items and from file links inside module Pages,
     Assignments, Discussions (incl. attachments) and Quizzes, plus pages those link
