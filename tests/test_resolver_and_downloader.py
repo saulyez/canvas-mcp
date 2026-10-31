@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from src.content_resolver import ContentResolver, FileRef
-from src.downloader import CanvasMaterialDownloader, sanitize_name
+from src.downloader import CanvasMaterialDownloader, module_folder_name, sanitize_name
 
 HOST = "canvas.example.ac.uk"
 API = f"https://{HOST}/api/v1"
@@ -222,7 +222,7 @@ def run(tmp_path, routes, dry_run=False, seen=None):
 def test_download_end_to_end(tmp_path):
     summary, seen = run(tmp_path, download_routes())
     course = tmp_path / "AI 1 (34238, 34237)"
-    w1, w2 = course / "Week 1_ _Intro", course / "Week 2 _ Revision"
+    w1, w2 = course / "week_1", course / "week_2"
     assert (w1 / "file101.pdf").read_bytes() == CONTENT[101]
     assert (w1 / "file101 (1).pdf").read_bytes() == CONTENT[102]  # name collision
     assert (w1 / "file103.pdf").exists() and (w1 / "file301.pdf").exists()
@@ -235,7 +235,7 @@ def test_download_end_to_end(tmp_path):
 
     manifest = json.loads((course / "manifest.json").read_text())
     m101 = next(f for f in manifest["files"] if f["file_id"] == 101)
-    assert m101["path"] == "Week 1_ _Intro/file101.pdf"
+    assert m101["path"] == "week_1/file101.pdf"
     assert [x["module"] for x in m101["also_referenced_in"]] == ["Week 2 / Revision"]
 
 
@@ -252,7 +252,7 @@ def test_rerun_keeps_names_and_updates_changed_file(tmp_path):
     try:
         routes = download_routes()
         summary, _ = run(tmp_path, routes)
-        p = tmp_path / "AI 1 (34238, 34237)" / "Week 1_ _Intro" / "file101 (1).pdf"
+        p = tmp_path / "AI 1 (34238, 34237)" / "week_1" / "file101 (1).pdf"
         assert p.read_bytes() == CONTENT[102]
         assert summary["files_by_status"]["updated"] == 1
     finally:
@@ -263,7 +263,7 @@ def test_dry_run_writes_nothing(tmp_path):
     summary, seen = run(tmp_path, download_routes(), dry_run=True)
     assert list(tmp_path.iterdir()) == [] and seen == []
     assert summary["files_by_status"]["would_download"] == 7
-    assert "Week 1_ _Intro/file101.pdf" in summary["planned_paths"]
+    assert "week_1/file101.pdf" in summary["planned_paths"]
 
 
 def test_size_mismatch_fails_cleanly(tmp_path):
@@ -273,3 +273,90 @@ def test_size_mismatch_fails_cleanly(tmp_path):
     assert summary["files_by_status"]["failed"] == 1
     assert "size mismatch" in summary["failed"][0]["error"]
     assert not list(tmp_path.rglob("*.part"))
+
+
+# ---------------------------------------------------------------- folder naming
+# Real module names from the user's courses (Phase 0 probe).
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Week 1: January 15th, 2024", "week_1"),
+        ("Week 11: April 22nd, 2024 (Revision)", "week_11"),
+        ("Week 01: September 30th, 2024", "week_1"),
+        ("Week 1 - Sept 28th 2026 - Introduction, Perceptron, Optimisation", "week_1"),
+        ("Week 6  Reading Week", "week_6"),
+        ("Week 7 - supporting materials - Understanding the things in the Internet of Things", "week_7"),
+        ("Semester 2   Week 1", "s2_week_1"),
+        ("S2 Week 6  Reading Week ", "s2_week_6"),
+        ("Semester 1 Week 3", "week_3"),
+        ("Week 1-4", "week_1-4"),
+        ("Weeks 12 to 16: Assessment Support and Final Assessments", "week_12-16"),
+        ("Week 6 - 2024 recap", "week_6"),  # not a range
+        ("About your module", "about_your_module"),
+        ("Exam Feedback and Resit", "exam_feedback_and_resit"),
+        ("Topic 01: Introduction, Arrays and Linked Lists", "topic_01_introduction_arrays_and_linked_lists"),
+        ("Consolidation Week", "consolidation_week"),
+        ("Revision Week April 2025: Mock exam", "revision_week_april_2025_mock_exam"),
+        ("1. Welcome & Settling In", "1_welcome_settling_in"),
+        ("Step 1 - Discover", "step_1_discover"),
+        ('<Module_Name> - This module is a "flat" template that can be used if you prefer using a single '
+         'Canvas page for your module.',
+         "module_name_this_module_is_a_flat_template_that_can_be_used_if_you_prefer_using_a_single_canvas_page_for_your_module"),
+        ("", "fallback"),
+    ],
+)
+def test_module_folder_name(raw, expected):
+    assert module_folder_name(raw, "fallback") == expected
+
+
+def test_same_week_modules_merge_into_one_folder(tmp_path):
+    routes = download_routes()
+    for m in routes[f"courses/{CID}/modules"]:
+        if m["id"] == 2:
+            m["name"] = "Week 1 - supporting materials"
+    summary, _ = run(tmp_path, routes)
+    course = tmp_path / "AI 1 (34238, 34237)"
+    assert sorted(d.name for d in course.iterdir() if d.is_dir()) == ["week_1"]
+    assert (course / "week_1" / "file201.pdf").exists()
+    assert summary["files_by_status"]["downloaded"] == 7
+
+
+def test_rename_migrates_existing_files_without_downloading(tmp_path):
+    run(tmp_path, download_routes())
+    course = tmp_path / "AI 1 (34238, 34237)"
+    # Simulate a download made with the old folder naming.
+    old = course / "Week 1_ _Intro"
+    (course / "week_1").rename(old)
+    mpath = course / "manifest.json"
+    manifest = json.loads(mpath.read_text())
+    for f in manifest["files"]:
+        if f["path"] and f["path"].startswith("week_1/"):
+            f["path"] = f["path"].replace("week_1/", "Week 1_ _Intro/", 1)
+    mpath.write_text(json.dumps(manifest))
+
+    # week_1 holds 101, 102 ("file101 (1).pdf"), 103, 301; week_2 holds 201, 202, 203.
+    dry, seen = run(tmp_path, download_routes(), dry_run=True)
+    assert dry["files_by_status"].get("would_move") == 4 and seen == []
+
+    summary, seen = run(tmp_path, download_routes())
+    assert summary["files_by_status"] == {"moved": 4, "already_present": 3, "skipped": 2}
+    assert seen == []  # nothing re-downloaded
+    assert not old.exists()  # emptied old folder removed
+    assert (course / "week_1" / "file101 (1).pdf").read_bytes() == CONTENT[102]
+
+
+def test_old_folder_with_foreign_files_is_kept(tmp_path):
+    run(tmp_path, download_routes())
+    course = tmp_path / "AI 1 (34238, 34237)"
+    old = course / "Old Week 1"
+    (course / "week_1").rename(old)
+    (old / "my_notes.txt").write_text("mine")
+    mpath = course / "manifest.json"
+    manifest = json.loads(mpath.read_text())
+    for f in manifest["files"]:
+        if f["path"] and f["path"].startswith("week_1/"):
+            f["path"] = f["path"].replace("week_1/", "Old Week 1/", 1)
+    mpath.write_text(json.dumps(manifest))
+    run(tmp_path, download_routes())
+    assert (old / "my_notes.txt").read_text() == "mine"
+    assert [p.name for p in old.iterdir()] == ["my_notes.txt"]

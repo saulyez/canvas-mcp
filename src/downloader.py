@@ -1,9 +1,12 @@
 """Download every Canvas file reachable from a course's modules.
 
-Layout: <destination_root>/<course name>/<module name>/<file display_name>
+Layout: <destination_root>/<course name>/<module folder>/<file display_name>
+Module folders: week_N, week_A-B, sK_week_N (semester K>1) for week modules,
+lowercase snake_case otherwise; modules mapping to the same folder are merged.
 A file referenced from several modules is stored once, in its "owner" module
 (direct module reference beats a followed link, then earliest module/item);
-the other references are listed in manifest.json.
+the other references are listed in manifest.json. When folder naming changes,
+files from a previous run are moved (not re-downloaded) using the manifest.
 """
 from __future__ import annotations
 
@@ -58,6 +61,43 @@ def with_suffix_index(filename: str, n: int) -> str:
     return f"{filename} ({n})"
 
 
+# "Semester 2 Week 1", "S2 Week 6"  (semester 1 is not prefixed)
+_SEMESTER_RE = re.compile(r"^(?:semester\s*|s)(\d)\s+", re.I)
+# "Week 1", "Week 01:", "Weeks 12 to 16", "Week 1-4"
+_WEEK_RE = re.compile(r"^weeks?\s*0*(\d+)(?:\s*(?:-|–|—|to)\s*0*(\d+))?(?!\d)", re.I)
+
+
+def snake_case(name: Optional[str], fallback: str, max_len: int = 120) -> str:
+    s = html.unescape(name or "").lower()
+    s = re.sub(r"[^\w]+", "_", s)  # keeps unicode letters/digits
+    s = re.sub(r"_{2,}", "_", s).strip("_")
+    if len(s) > max_len:
+        s = s[:max_len]
+        if "_" in s:
+            s = s.rsplit("_", 1)[0]
+    return sanitize_name(s, fallback, max_len)
+
+
+def module_folder_name(name: Optional[str], fallback: str) -> str:
+    """week_N / week_A-B / sK_week_N for week modules, snake_case otherwise.
+
+    Different modules that map to the same name share one folder (merge)."""
+    raw = re.sub(r"\s+", " ", html.unescape(name or "")).strip()
+    rest, prefix = raw, ""
+    sem = _SEMESTER_RE.match(raw)
+    if sem:
+        rest = raw[sem.end():]
+        if sem.group(1) != "1":
+            prefix = f"s{sem.group(1)}_"
+    week = _WEEK_RE.match(rest)
+    if week:
+        start, end = int(week.group(1)), week.group(2)
+        if end is not None and start < int(end) <= 60:
+            return f"{prefix}week_{start}-{int(end)}"
+        return f"{prefix}week_{start}"
+    return snake_case(raw, fallback)
+
+
 @dataclass
 class PlannedFile:
     file_id: int
@@ -65,6 +105,7 @@ class PlannedFile:
     also_in: list[FileRef]
     meta: dict[str, Any] = field(default_factory=dict)
     rel_path: Optional[Path] = None
+    prior_path: Optional[Path] = None  # path recorded by a previous run's manifest
     status: str = "pending"
     error: Optional[str] = None
 
@@ -106,11 +147,14 @@ class CanvasMaterialDownloader:
                 transport=self._transport,
             ) as http:
                 await asyncio.gather(*(self._download(http, course_dir, p, sem) for p in planned))
+            self._remove_emptied_dirs(course_dir, planned)
             self._write_manifest(course_dir, course_id, course_name, planned, report)
         else:
+            dry = {"already_present": "already_present", "move": "would_move",
+                   "update": "would_update", "download": "would_download"}
             for p in planned:
-                if p.status == "pending":
-                    p.status = "would_download"
+                if p.status == "pending" and p.rel_path is not None:
+                    p.status = dry[self._classify(course_dir, p)]
 
         return self._summary(course_id, course_name, course_dir, planned, report, dry_run)
 
@@ -150,15 +194,12 @@ class CanvasMaterialDownloader:
             p.status, p.error = "skipped", "no download url"
 
     def _assign_paths(self, planned: list[PlannedFile], course_dir: Path, previous: dict[int, str]) -> None:
-        # Module folder names; disambiguate duplicates by module id.
-        names: dict[int, str] = {}
-        used: Counter = Counter()
-        for p in planned:
-            mid = p.owner.module_id
-            if mid not in names:
-                base = sanitize_name(p.owner.module_name, f"module_{mid}")
-                used[base] += 1
-                names[mid] = base if used[base] == 1 else f"{base} ({mid})"
+        # Modules mapping to the same folder name (e.g. "Week 7" and
+        # "Week 7 - supporting materials") deliberately share one folder.
+        names = {
+            p.owner.module_id: module_folder_name(p.owner.module_name, f"module_{p.owner.module_id}")
+            for p in planned
+        }
 
         owners = {Path(v): k for k, v in previous.items()}
         taken: set[Path] = set()
@@ -167,6 +208,8 @@ class CanvasMaterialDownloader:
                 continue
             module_dir = Path(names[p.owner.module_id])
             prior = previous.get(p.file_id)
+            if prior:
+                p.prior_path = Path(prior)
             if prior and Path(prior).parent == module_dir and Path(prior) not in taken:
                 rel = Path(prior)  # keep the name chosen on an earlier run
             else:
@@ -185,15 +228,43 @@ class CanvasMaterialDownloader:
             p.rel_path = rel
 
     # -------------------------------------------------------------- download
+    def _classify(self, course_dir: Path, p: PlannedFile) -> str:
+        """already_present | move | update | download"""
+        assert p.rel_path is not None
+        target = course_dir / p.rel_path
+        size = p.meta.get("size")
+        if target.exists():
+            if size is not None and target.stat().st_size == size:
+                return "already_present"
+            return "update"
+        if p.prior_path is not None and p.prior_path != p.rel_path:
+            prior = (course_dir / p.prior_path).resolve()
+            if (
+                prior.is_relative_to(course_dir.resolve())
+                and prior.is_file()
+                and (size is None or prior.stat().st_size == size)
+            ):
+                return "move"
+        return "download"
+
     async def _download(self, http: httpx.AsyncClient, course_dir: Path, p: PlannedFile, sem: asyncio.Semaphore) -> None:
         if p.status != "pending" or p.rel_path is None:
             return
         target = course_dir / p.rel_path
         size = p.meta.get("size")
-        existed = target.exists()
-        if existed and size is not None and target.stat().st_size == size:
+        action = self._classify(course_dir, p)
+        if action == "already_present":
             p.status = "already_present"
             return
+        if action == "move" and p.prior_path is not None:  # folder naming changed since the last run
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(course_dir / p.prior_path, target)
+                p.status = "moved"
+                return
+            except OSError as exc:
+                log.warning("move failed for %s, downloading instead: %s", p.rel_path, exc)
+        existed = action == "update"
 
         part = target.with_name(target.name + ".part")
         async with sem:
@@ -230,6 +301,19 @@ class CanvasMaterialDownloader:
 
     # -------------------------------------------------------------- manifest
     @staticmethod
+    def _remove_emptied_dirs(course_dir: Path, planned: list[PlannedFile]) -> None:
+        """After moves, delete old module folders that are now empty (never anything else)."""
+        for p in planned:
+            if p.status == "moved" and p.prior_path is not None:
+                d = (course_dir / p.prior_path).parent
+                while d != course_dir and d.is_relative_to(course_dir):
+                    try:
+                        d.rmdir()  # only succeeds when empty
+                    except OSError:
+                        break
+                    d = d.parent
+
+    @staticmethod
     def _load_manifest(course_dir: Path) -> dict[int, str]:
         try:
             data = json.loads((course_dir / MANIFEST_NAME).read_text())
@@ -259,7 +343,7 @@ class CanvasMaterialDownloader:
                     "display_name": p.meta.get("display_name"),
                     "content_type": p.meta.get("content-type"),
                     "size": p.meta.get("size"),
-                    "path": str(p.rel_path) if p.rel_path and p.status in {"downloaded", "updated", "already_present"} else None,
+                    "path": str(p.rel_path) if p.rel_path and p.status in {"downloaded", "updated", "already_present", "moved"} else None,
                     "status": p.status,
                     "error": p.error,
                     **self._ref_dict(p.owner),
